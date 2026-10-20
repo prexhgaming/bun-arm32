@@ -1,29 +1,28 @@
-name: Experimental Bun ARM32 Build
+name: Bun ARM32 port pipeline
 
 on:
   workflow_dispatch:
     inputs:
       bun_ref:
-        description: "Bun branch, tag, or commit"
+        description: Bun branch, tag, or commit to inspect
         required: true
-        default: "main"
+        default: 6f58f6b89446918c534223c3c32df7feec62abea
         type: string
-
       target:
-        description: "Target platform"
+        description: Target ABI
         required: true
         type: choice
         options:
           - linux-armv7
-          - android-armv7
         default: linux-armv7
-
   push:
     paths:
-      - ".github/workflows/build-arm32.yml"
-      - "patches/**"
-      - "scripts/**"
-      - "tests/**"
+      - '.github/workflows/build-arm32.yml'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'docs/**'
+      - 'README.md'
 
 permissions:
   contents: read
@@ -33,127 +32,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build ${{ inputs.target || 'linux-armv7' }}
+  arm32-port:
+    name: ARMv7 toolchain and upstream feasibility
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ inputs.target || 'linux-armv7' }}
+      BUN_REF: ${{ inputs.bun_ref || '6f58f6b89446918c534223c3c32df7feec62abea' }}
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Check out porting repository
+      - name: Checkout port repository
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install ARMHF toolchain and emulation
         run: |
+          sudo dpkg --add-architecture armhf
           sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates python3 file binutils \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf libc6-dev-armhf-cross \
+            qemu-user qemu-user-binfmt pkg-config cmake ninja-build \
+            make clang lld perl unzip xz-utils zstd
 
-          sudo apt-get install -y \
-            git \
-            curl \
-            wget \
-            python3 \
-            cmake \
-            ninja-build \
-            make \
-            clang \
-            lld \
-            pkg-config \
-            binutils \
-            file \
-            unzip \
-            xz-utils \
-            zstd \
-            perl
+      - name: Install host Bun bootstrap
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
-      - name: Clone Bun source
-        env:
-          BUN_REF: ${{ inputs.bun_ref || 'main' }}
+      - name: Install Rust and ARM32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Clone pinned upstream source
         run: |
-          git clone \
-            --recurse-submodules \
-            https://github.com/oven-sh/bun.git \
-            upstream
+          git clone https://github.com/oven-sh/bun.git upstream
+          git -C upstream checkout --detach "$BUN_REF"
+          git -C upstream submodule update --init --recursive
+          git -C upstream rev-parse HEAD | tee bun-source-commit.txt
 
-          cd upstream
-          git checkout "$BUN_REF"
-          git submodule update --init --recursive
+      - name: Cross-compile and execute ARMHF ABI probe
+        run: bash scripts/test-armhf-toolchain.sh
 
-      - name: Record source revision
+      - name: Audit Bun source for ARM32 readiness
+        run: bash scripts/audit-upstream.sh
+
+      - name: Build Bun ARM32 if a real port patch is present
+        id: build
         run: |
-          git -C upstream rev-parse HEAD \
-            | tee bun-source-commit.txt
-
-      - name: Report build target
-        env:
-          TARGET: ${{ inputs.target || 'linux-armv7' }}
-        run: |
-          echo "Selected target: $TARGET"
-          echo "Runner architecture:"
-          uname -m
-
-      - name: Apply porting patches
-        run: |
-          if [ -d patches ]; then
-            for patch in patches/*.patch; do
-              [ -f "$patch" ] || continue
-
-              git -C upstream apply \
-                --check "$GITHUB_WORKSPACE/$patch"
-
-              git -C upstream apply \
-                "$GITHUB_WORKSPACE/$patch"
-            done
+          if [[ ! -f patches/arm32-port.patch ]]; then
+            echo 'No patches/arm32-port.patch exists yet.' | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'The toolchain test and source audit are complete, but upstream Bun has no supported ARM32 build target. A real JavaScriptCore/Bun port patch is required before a runtime build can be attempted.' | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'runtime_built=false' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          git -C upstream apply --check "$GITHUB_WORKSPACE/patches/arm32-port.patch"
+          git -C upstream apply "$GITHUB_WORKSPACE/patches/arm32-port.patch"
+          bash scripts/build-arm32.sh linux-armv7
+          echo 'runtime_built=true' >> "$GITHUB_OUTPUT"
 
-      - name: Check target support
-        run: |
-          echo "Checking the actual upstream build configuration."
-
-          cd upstream
-
-          git status --short
-          git log -1 --oneline
-
-          echo "The ARM32 port must provide the necessary"
-          echo "compiler, JavaScriptCore, and dependency changes."
-
-      - name: Build Bun ARM32
+      - name: Verify runtime artifact
+        if: steps.build.outputs.runtime_built == 'true'
         env:
-          TARGET: ${{ inputs.target || 'linux-armv7' }}
+          BUN_BINARY: ${{ github.workspace }}/artifacts/bun
         run: |
-          chmod +x "$GITHUB_WORKSPACE/scripts/build-arm32.sh"
-          "$GITHUB_WORKSPACE/scripts/build-arm32.sh" "$TARGET"
+          bash scripts/verify-binary.sh
+          bash tests/smoke-test.sh artifacts/bun
 
-      - name: Verify binary
-        run: |
-          chmod +x scripts/verify-binary.sh
-          ./scripts/verify-binary.sh
-
-      - name: Collect build information
+      - name: Collect reports
         if: always()
         run: |
           mkdir -p artifacts
+          cp bun-source-commit.txt artifacts/ 2>/dev/null || true
+          git -C upstream status --short > artifacts/upstream-status.txt 2>/dev/null || true
+          git -C upstream log -1 --oneline > artifacts/upstream-revision.txt 2>/dev/null || true
 
-          cp bun-source-commit.txt artifacts/ \
-            2>/dev/null || true
-
-          git -C upstream status --short \
-            > artifacts/upstream-status.txt \
-            2>/dev/null || true
-
-      - name: Upload build artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bun-arm32-${{ inputs.target || 'linux-armv7' }}
-          path: artifacts/
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload ARM32 diagnostics
+      - name: Upload reports and any binary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bun-arm32-diagnostics
+          name: bun-arm32-${{ env.TARGET }}
           path: artifacts/
-          if-no-files-found: ignore
-          retention-days: 7
+          if-no-files-found: warn
+          retention-days: 14
