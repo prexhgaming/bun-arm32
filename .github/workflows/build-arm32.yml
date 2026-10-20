@@ -47,7 +47,9 @@ jobs:
 
       - name: Install ARMHF toolchain and emulation
         run: |
-          sudo dpkg --add-architecture armhf
+          # Cross-compilation packages run on the x86_64 host; do not enable
+          # armhf as a host dpkg architecture. Ubuntu 24.04's standard
+          # repositories do not publish armhf package indexes at these URLs.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git curl ca-certificates python3 file binutils \
