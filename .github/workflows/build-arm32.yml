@@ -1,0 +1,161 @@
+name: Experimental Bun ARM32 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      bun_ref:
+        description: "Bun branch, tag, or commit"
+        required: true
+        default: "main"
+        type: string
+
+      target:
+        description: "Target platform"
+        required: true
+        type: choice
+        options:
+          - linux-armv7
+          - android-armv7
+        default: linux-armv7
+
+  push:
+    paths:
+      - ".github/workflows/build-arm32.yml"
+      - "patches/**"
+      - "scripts/**"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bun-arm32-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ inputs.target || 'linux-armv7' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out porting repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            python3 \
+            cmake \
+            ninja-build \
+            make \
+            clang \
+            lld \
+            pkg-config \
+            binutils \
+            file \
+            unzip \
+            xz-utils \
+            zstd \
+            perl
+
+      - name: Clone Bun source
+        env:
+          BUN_REF: ${{ inputs.bun_ref || 'main' }}
+        run: |
+          git clone \
+            --recurse-submodules \
+            https://github.com/oven-sh/bun.git \
+            upstream
+
+          cd upstream
+          git checkout "$BUN_REF"
+          git submodule update --init --recursive
+
+      - name: Record source revision
+        run: |
+          git -C upstream rev-parse HEAD \
+            | tee bun-source-commit.txt
+
+      - name: Report build target
+        env:
+          TARGET: ${{ inputs.target || 'linux-armv7' }}
+        run: |
+          echo "Selected target: $TARGET"
+          echo "Runner architecture:"
+          uname -m
+
+      - name: Apply porting patches
+        run: |
+          if [ -d patches ]; then
+            for patch in patches/*.patch; do
+              [ -f "$patch" ] || continue
+
+              git -C upstream apply \
+                --check "$GITHUB_WORKSPACE/$patch"
+
+              git -C upstream apply \
+                "$GITHUB_WORKSPACE/$patch"
+            done
+          fi
+
+      - name: Check target support
+        run: |
+          echo "Checking the actual upstream build configuration."
+
+          cd upstream
+
+          git status --short
+          git log -1 --oneline
+
+          echo "The ARM32 port must provide the necessary"
+          echo "compiler, JavaScriptCore, and dependency changes."
+
+      - name: Build Bun ARM32
+        env:
+          TARGET: ${{ inputs.target || 'linux-armv7' }}
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/scripts/build-arm32.sh"
+          "$GITHUB_WORKSPACE/scripts/build-arm32.sh" "$TARGET"
+
+      - name: Verify binary
+        run: |
+          chmod +x scripts/verify-binary.sh
+          ./scripts/verify-binary.sh
+
+      - name: Collect build information
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          cp bun-source-commit.txt artifacts/ \
+            2>/dev/null || true
+
+          git -C upstream status --short \
+            > artifacts/upstream-status.txt \
+            2>/dev/null || true
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-arm32-${{ inputs.target || 'linux-armv7' }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-arm32-build-diagnostics
+          path: |
+            bun-source-commit.txt
+            upstream/
+          if-no-files-found: ignore
+          retention-days: 7
