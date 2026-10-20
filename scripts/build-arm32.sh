@@ -11,55 +11,111 @@ ARTIFACTS="$ROOT/artifacts"
 mkdir -p "$ARTIFACTS"
 
 if [[ ! -d "$UPSTREAM/.git" ]]; then
-    echo "ERROR: Bun upstream source was not checked out." >&2
+    echo "::error::Bun source checkout not found."
     exit 1
 fi
 
 case "$TARGET" in
     linux-armv7)
-        echo "Target: Linux ARMv7 / ARM32"
-        echo "ABI: Linux ARMHF must be configured explicitly."
+        TARGET_TRIPLE="arm-linux-gnueabihf"
         ;;
-
     android-armv7)
-        echo "Target: Android ARMv7 / armeabi-v7a"
-        echo "An Android NDK toolchain must be configured."
+        TARGET_TRIPLE="armv7a-linux-androideabi"
         ;;
-
     *)
-        echo "ERROR: Unsupported target: $TARGET" >&2
+        echo "::error::Unsupported target: $TARGET"
         exit 2
         ;;
 esac
 
-echo
-echo "Checking for the actual Bun build entry points..."
+echo "Target: $TARGET"
+echo "Target triple: $TARGET_TRIPLE"
 
 cd "$UPSTREAM"
 
-for candidate in build.zig Makefile package.json; do
-    if [[ -f "$candidate" ]]; then
-        echo "Found: $candidate"
+echo
+echo "=== Bun source revision ==="
+git log -1 --oneline
+
+echo
+echo "=== Repository structure ==="
+find . -maxdepth 3 \
+    \( -name build.zig -o -name CMakeLists.txt \
+       -o -name package.json -o -name Makefile \
+       -o -name '*.zig' \) \
+    -not -path './.git/*' \
+    | head -n 150
+
+echo
+echo "=== Bun build scripts ==="
+node -e '
+const p = require("./package.json");
+console.log(JSON.stringify({
+  name: p.name,
+  version: p.version,
+  packageManager: p.packageManager,
+  scripts: p.scripts
+}, null, 2));
+'
+
+echo
+echo "=== Architecture references ==="
+
+grep -RInE \
+    'aarch64|arm64|armv7|armhf|x86_64|linux-arm' \
+    --include='*.zig' \
+    --include='*.json' \
+    --include='*.toml' \
+    --include='*.sh' \
+    --exclude-dir=.git \
+    . 2>/dev/null \
+    | head -n 250 || true
+
+echo
+echo "=== Available compiler tools ==="
+
+for tool in zig clang gcc cmake ninja python3 node npm; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        printf '%-10s %s\n' "$tool" "$(command -v "$tool")"
+    else
+        printf '%-10s unavailable\n' "$tool"
     fi
 done
 
 echo
-echo "Build configuration inspection:"
-git log -1 --oneline
+echo "=== Available ARM cross-compilers ==="
 
-if [[ -f build.zig ]]; then
-    sed -n '1,200p' build.zig
-fi
+for tool in \
+    arm-linux-gnueabihf-gcc \
+    arm-linux-gnueabihf-g++ \
+    arm-linux-gnueabihf-ld \
+    arm-linux-gnueabihf-as; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        printf '%s: %s\n' "$tool" "$(command -v "$tool")"
+    fi
+done
 
-cat <<'EOF'
+echo
+echo "=== ELF and platform information ==="
 
-STOPPED: ARM32 compilation is not implemented yet.
+uname -a
+getconf LONG_BIT || true
+node -p '"Node architecture: " + process.arch'
 
-Before this script can produce Bun, the port must implement and
-validate the target configuration, compatible JavaScriptCore,
-native dependencies, and the actual upstream build invocation.
+echo
+echo "=== Save diagnostic report ==="
 
-No binary has been produced.
-EOF
+{
+    echo "Target: $TARGET"
+    echo "Target triple: $TARGET_TRIPLE"
+    git log -1 --oneline
+    uname -a
+    getconf LONG_BIT || true
+    node --version
+    npm --version
+} > "$ARTIFACTS/arm32-diagnostics.txt"
 
-exit 1
+echo
+echo "Diagnostics completed."
+echo "This step does not claim to have built Bun."
+echo "Report: artifacts/arm32-diagnostics.txt"
